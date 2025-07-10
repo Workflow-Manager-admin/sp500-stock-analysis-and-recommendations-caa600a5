@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+yfinance
+pydantic
+python-dotenv
+requests
+# Used for CORS during development
+aiofiles
