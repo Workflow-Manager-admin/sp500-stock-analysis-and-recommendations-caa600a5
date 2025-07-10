@@ -11,16 +11,49 @@ Depends on yfinance for data, FastAPI for the REST API.
 import os
 import uvicorn
 import yfinance as yf
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
 from pydantic import BaseModel, Field
 
-# Load sample S&P 500 ticker list for demo/speedup. Expand or update as needed.
-SAMPLE_SP500_TICKERS = [
-    "AAPL", "MSFT", "GOOGL", "AMZN", "META",
-    "TSLA", "NVDA", "JPM", "V", "UNH"
-]
+# --- Load S&P 500 Tickers ---
+
+def load_sp500_tickers():
+    """
+    Loads the S&P 500 tickers from a static file or dynamic source.
+    Returns a list of ticker symbols (str).
+    """
+    static_file = os.path.join(os.path.dirname(__file__), "sample_sp500_tickers.txt")
+    tickers = []
+
+    # Attempt to use static file
+    if os.path.exists(static_file):
+        with open(static_file) as f:
+            for line in f:
+                sym = line.strip().upper()
+                if sym and sym not in tickers:
+                    tickers.append(sym)
+
+    # If less than 100 tickers loaded, try fetching from Wikipedia (fallback)
+    if len(tickers) < 100:
+        # Minimal requirement: install 'requests' already in requirements.txt
+        import requests
+        import pandas as pd
+        try:
+            url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+            tables = pd.read_html(requests.get(url).text)
+            df = tables[0]
+            if "Symbol" in df.columns:
+                symbols = df["Symbol"].tolist()
+                # Sometimes Wikipedia may use "." instead of "-" for tickers (e.g., BRK.B)
+                tickers = [sym.replace(".", "-").upper() for sym in symbols if isinstance(sym, str)]
+        except Exception:
+            # Fallback to bundled short list
+            if not tickers:
+                tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "TSLA", "NVDA", "JPM", "V", "UNH"]
+    return tickers
+
+SP500_TICKERS = load_sp500_tickers()
 
 # --- Models ---
 
@@ -49,7 +82,17 @@ class StockDetail(StockSummary):
 app = FastAPI(
     title="S&P 500 Stock Evaluator Backend API",
     description="RESTful API for analyzing S&P 500 stocks with indicator-based BUY/HOLD/SELL recommendations.",
-    version="1.0.0"
+    version="1.0.0",
+    openapi_tags=[
+        {
+            "name": "Stocks",
+            "description": "Endpoints returning table and detail data for S&P 500 stocks."
+        },
+        {
+            "name": "System",
+            "description": "API health and system status."
+        }
+    ]
 )
 
 # Allow frontend to request from different origin (for development use)
@@ -92,15 +135,14 @@ def score_indicators(info: dict) -> (IndicatorBreakdown, float, str):
     # Score logic (simple, for demo purposes. Refine as required.)
     score = 0
     max_score = 5
-    score_details = []
 
     if pe is not None:
-        if pe < 15: score += 1; score_details.append("Good PE")
-        elif pe < 25: score += 0.5; score_details.append("Decent PE")
-    if pb is not None and pb < 3: score += 1; score_details.append("Good PB")
-    if debt is not None and debt < 1: score += 1; score_details.append("Low Debt")
-    if roe is not None and roe > 0.1: score += 1; score_details.append("High ROE")
-    if pm is not None and pm > 0.1: score += 1; score_details.append("Strong Margin")
+        if pe < 15: score += 1
+        elif pe < 25: score += 0.5
+    if pb is not None and pb < 3: score += 1
+    if debt is not None and debt < 1: score += 1
+    if roe is not None and roe > 0.1: score += 1
+    if pm is not None and pm > 0.1: score += 1
 
     norm_score = (score / max_score) * 100
     if norm_score >= 80:
@@ -114,31 +156,70 @@ def score_indicators(info: dict) -> (IndicatorBreakdown, float, str):
         pe_ratio=pe,
         price_to_book=pb,
         debt_to_equity=debt,
-        return_on_equity=roe*100 if roe is not None else None,
-        profit_margin=pm*100 if pm is not None else None
+        return_on_equity=roe * 100 if roe is not None else None,
+        profit_margin=pm * 100 if pm is not None else None
     )
     return indi, norm_score, reco
 
 # --- API Endpoints ---
 
 # PUBLIC_INTERFACE
-@app.get("/stocks", response_model=List[StockSummary], tags=["Stocks"])
-def get_stocks(limit: int = 10, search: Optional[str] = None):
+@app.get(
+    "/stocks",
+    response_model=List[StockSummary],
+    tags=["Stocks"],
+    summary="List S&P 500 stocks with analysis",
+    description="""
+Returns a list of S&P 500 stocks with indicator analysis.
+
+- Optional limit: Number of stocks to return (default all S&P 500).
+- Optional page: Page number for pagination (starts at 1; must be >=1).
+- Optional search: Filter by ticker or company name substring.
+
+The endpoint is optimized for large result sets. Use `limit` and `page` for efficient data consumption on large data sets.
+    """
+)
+def get_stocks(
+    limit: Optional[int] = Query(None, ge=1, le=500, description="Number of stocks to return (max 500; default: all S&P 500)"),
+    page: Optional[int] = Query(1, ge=1, description="Page number for pagination (starts at 1)"),
+    search: Optional[str] = Query(None, description="Filter by ticker or company name substring"),
+):
     """
     Returns a list of S&P 500 stocks with indicator analysis.
-    - Optional limit: Number of stocks to return (default 10).
-    - Optional search: Filter by ticker or company name substring.
+    If limit is not supplied, returns all available tickers.
+    Use search parameter to filter.
     """
+    raw_tickers = SP500_TICKERS[:]
     results = []
-    tickers = SAMPLE_SP500_TICKERS[:limit]
-    for tkr in tickers:
+
+    # Apply search filtering
+    if search:
+        filtered = []
+        s_l = search.lower()
+        for tkr in raw_tickers:
+            info, err = fetch_yf_info(tkr)
+            if err or not info or not info.get("shortName"):
+                continue
+            if s_l in tkr.lower() or s_l in info.get("shortName", "").lower():
+                filtered.append(tkr)
+        tickers = filtered
+    else:
+        tickers = raw_tickers
+
+    total = len(tickers)
+    # Pagination
+    page = page or 1
+    if limit is not None:
+        start = (page - 1) * limit
+        end = min(start + limit, total)
+        paged_tickers = tickers[start:end]
+    else:
+        paged_tickers = tickers
+
+    for tkr in paged_tickers:
         info, err = fetch_yf_info(tkr)
         if err or not info or not info.get("shortName"):
-            continue  # Skip unlisted/errored symbols
-
-        if search:
-            if search.lower() not in tkr.lower() and search.lower() not in info.get("shortName", "").lower():
-                continue  # Not matching search
+            continue
 
         indicators, indicator_score, recommendation = score_indicators(info)
         summary = StockSummary(
@@ -150,10 +231,17 @@ def get_stocks(limit: int = 10, search: Optional[str] = None):
             indicators=indicators
         )
         results.append(summary)
+
     return results
 
 # PUBLIC_INTERFACE
-@app.get("/stocks/{ticker}", response_model=StockDetail, tags=["Stocks"])
+@app.get(
+    "/stocks/{ticker}",
+    response_model=StockDetail,
+    tags=["Stocks"],
+    summary="Detailed ticker info",
+    description="Returns detailed stock and indicator analysis for one ticker."
+)
 def get_stock_detail(ticker: str):
     """
     Returns detailed stock and indicator analysis for one ticker.

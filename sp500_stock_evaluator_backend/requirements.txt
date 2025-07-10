@@ -4,5 +4,6 @@ yfinance
 pydantic
 python-dotenv
 requests
+pandas
 # Used for CORS during development
 aiofiles
